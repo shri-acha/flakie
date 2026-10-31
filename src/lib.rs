@@ -7,6 +7,8 @@
 //! is configured.
 
 mod config;
+mod source;
 
 pub use config::{BackoffConfig, S3Config, TransferConfig};
+pub use source::{DownloadRequest, Source, UploadRequest};
 
