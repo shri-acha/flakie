@@ -184,8 +184,7 @@ where
         worker.await.context("transfer worker task failed")?;
     }
 
-    let mut completed =
-        std::mem::take(&mut *completed.lock().expect("completed mutex poisoned"));
+    let mut completed = std::mem::take(&mut *completed.lock().expect("completed mutex poisoned"));
     let failed = std::mem::take(&mut *failed.lock().expect("failed mutex poisoned"));
 
     if !failed.is_empty() {
@@ -210,11 +209,7 @@ async fn run_worker<S: Source>(
     operation: &'static str,
 ) {
     loop {
-        let Some(mut queued) = queue
-            .lock()
-            .expect("queue mutex poisoned")
-            .pop_front()
-        else {
+        let Some(mut queued) = queue.lock().expect("queue mutex poisoned").pop_front() else {
             return;
         };
 
@@ -371,10 +366,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_download_is_requeued_and_retried() {
-        let store = MockSource::new(&[
-            ("a.mbtiles", vec![false, true]),
-            ("b.mbtiles", vec![true]),
-        ]);
+        let store = MockSource::new(&[("a.mbtiles", vec![false, true]), ("b.mbtiles", vec![true])]);
         let requests = vec![
             DownloadRequest::new("a.mbtiles", "/tmp/a.mbtiles"),
             DownloadRequest::new("b.mbtiles", "/tmp/b.mbtiles"),
@@ -411,10 +403,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_upload_is_requeued_and_retried() {
-        let store = MockSource::new(&[
-            ("a.mbtiles", vec![false, true]),
-            ("b.mbtiles", vec![true]),
-        ]);
+        let store = MockSource::new(&[("a.mbtiles", vec![false, true]), ("b.mbtiles", vec![true])]);
         let requests = vec![
             UploadRequest::new("/tmp/a.mbtiles", "a.mbtiles", None::<String>),
             UploadRequest::new("/tmp/b.mbtiles", "b.mbtiles", None::<String>),
@@ -446,4 +435,3 @@ mod tests {
         assert!(uploads.is_empty());
     }
 }
-

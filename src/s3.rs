@@ -67,6 +67,7 @@ impl S3Source {
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
             .write(true)
+            .truncate(false)
             .open(part_path)
             .await?;
         file.set_len(offset).await?;
@@ -118,11 +119,7 @@ impl Source for S3Source {
                             .with_context(|| format!("creating {}", parent.display()))?;
                     }
                     tokio::fs::rename(&part_path, path).await.with_context(|| {
-                        format!(
-                            "renaming downloaded object {} to {}",
-                            key,
-                            path.display()
-                        )
+                        format!("renaming downloaded object {} to {}", key, path.display())
                     })?;
                     return Ok(());
                 }
@@ -148,7 +145,12 @@ impl Source for S3Source {
         let body = ByteStream::from_path(path)
             .await
             .with_context(|| format!("reading upload source {}", path.display()))?;
-        let mut request = self.client.put_object().bucket(&self.bucket).key(key).body(body);
+        let mut request = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .body(body);
         if let Some(content_type) = content_type {
             request = request.content_type(content_type);
         }
@@ -211,4 +213,3 @@ mod tests {
         );
     }
 }
-

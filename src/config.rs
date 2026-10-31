@@ -136,7 +136,10 @@ impl fmt::Debug for S3Config {
             .field("region", &self.region)
             .field("connect_timeout", &self.connect_timeout)
             .field("read_timeout", &self.read_timeout)
-            .field("stalled_stream_grace_period", &self.stalled_stream_grace_period)
+            .field(
+                "stalled_stream_grace_period",
+                &self.stalled_stream_grace_period,
+            )
             .field("backoff", &self.backoff)
             .finish()
     }
@@ -183,4 +186,3 @@ mod tests {
         assert_eq!(delay, Duration::from_secs(u32::MAX as u64));
     }
 }
-
