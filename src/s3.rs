@@ -197,3 +197,18 @@ fn partial_download_path(path: &Path) -> PathBuf {
     PathBuf::from(part_path)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partial_download_path_appends_suffix() {
+        let path = Path::new("/tmp/object.mbtiles");
+
+        assert_eq!(
+            partial_download_path(path),
+            PathBuf::from("/tmp/object.mbtiles.part")
+        );
+    }
+}
+

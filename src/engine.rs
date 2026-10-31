@@ -269,3 +269,181 @@ async fn run_worker<S: Source>(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use std::collections::{HashMap, VecDeque};
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+
+    use super::{download_all, upload_all};
+    use crate::config::TransferConfig;
+    use crate::source::{DownloadRequest, Source, UploadRequest};
+
+    #[derive(Clone)]
+    struct MockSource {
+        attempts: Arc<Mutex<HashMap<String, usize>>>,
+        outcomes: Arc<Mutex<HashMap<String, VecDeque<bool>>>>,
+    }
+
+    impl MockSource {
+        fn new(outcomes: &[(&str, Vec<bool>)]) -> Self {
+            Self {
+                attempts: Arc::new(Mutex::new(HashMap::new())),
+                outcomes: Arc::new(Mutex::new(
+                    outcomes
+                        .iter()
+                        .map(|(key, values)| {
+                            (
+                                key.to_string(),
+                                values.iter().copied().collect::<VecDeque<_>>(),
+                            )
+                        })
+                        .collect(),
+                )),
+            }
+        }
+
+        fn attempt_count(&self, key: &str) -> usize {
+            self.attempts
+                .lock()
+                .expect("attempts mutex poisoned")
+                .get(key)
+                .copied()
+                .unwrap_or_default()
+        }
+
+        fn next_outcome(&self, key: &str) -> anyhow::Result<()> {
+            let attempt = {
+                let mut attempts = self.attempts.lock().expect("attempts mutex poisoned");
+                let attempt = attempts.entry(key.to_string()).or_insert(0);
+                *attempt += 1;
+                *attempt
+            };
+            let succeeds = self
+                .outcomes
+                .lock()
+                .expect("outcomes mutex poisoned")
+                .get_mut(key)
+                .and_then(|outcomes| outcomes.pop_front())
+                .unwrap_or(true);
+            if succeeds {
+                Ok(())
+            } else {
+                anyhow::bail!("mock transfer failure on attempt {attempt}")
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Source for MockSource {
+        async fn download(&self, key: &str, _path: &Path) -> anyhow::Result<()> {
+            self.next_outcome(key)
+        }
+
+        async fn upload(
+            &self,
+            _path: &Path,
+            key: &str,
+            _content_type: Option<&str>,
+        ) -> anyhow::Result<()> {
+            self.next_outcome(key)
+        }
+
+        async fn exists(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+
+        async fn delete(&self, _key: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn transfer_config() -> TransferConfig {
+        TransferConfig {
+            concurrency: 2,
+            max_attempts: 3,
+            retry_delay: Duration::ZERO,
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_download_is_requeued_and_retried() {
+        let store = MockSource::new(&[
+            ("a.mbtiles", vec![false, true]),
+            ("b.mbtiles", vec![true]),
+        ]);
+        let requests = vec![
+            DownloadRequest::new("a.mbtiles", "/tmp/a.mbtiles"),
+            DownloadRequest::new("b.mbtiles", "/tmp/b.mbtiles"),
+        ];
+
+        let completed = download_all(store.clone(), &transfer_config(), requests)
+            .await
+            .unwrap();
+
+        assert_eq!(completed.len(), 2);
+        assert_eq!(completed[0].key, "a.mbtiles");
+        assert_eq!(completed[1].key, "b.mbtiles");
+        assert_eq!(store.attempt_count("a.mbtiles"), 2);
+        assert_eq!(store.attempt_count("b.mbtiles"), 1);
+    }
+
+    #[tokio::test]
+    async fn download_that_keeps_failing_is_reported_after_max_attempts() {
+        let store = MockSource::new(&[
+            ("a.mbtiles", vec![false, false, false]),
+            ("b.mbtiles", vec![true]),
+        ]);
+        let requests = vec![
+            DownloadRequest::new("a.mbtiles", "/tmp/a.mbtiles"),
+            DownloadRequest::new("b.mbtiles", "/tmp/b.mbtiles"),
+        ];
+
+        let result = download_all(store.clone(), &transfer_config(), requests).await;
+
+        assert!(result.is_err());
+        assert_eq!(store.attempt_count("a.mbtiles"), 3);
+        assert_eq!(store.attempt_count("b.mbtiles"), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_upload_is_requeued_and_retried() {
+        let store = MockSource::new(&[
+            ("a.mbtiles", vec![false, true]),
+            ("b.mbtiles", vec![true]),
+        ]);
+        let requests = vec![
+            UploadRequest::new("/tmp/a.mbtiles", "a.mbtiles", None::<String>),
+            UploadRequest::new("/tmp/b.mbtiles", "b.mbtiles", None::<String>),
+        ];
+
+        let completed = upload_all(store.clone(), &transfer_config(), requests)
+            .await
+            .unwrap();
+
+        assert_eq!(completed.len(), 2);
+        assert_eq!(completed[0].key, "a.mbtiles");
+        assert_eq!(completed[1].key, "b.mbtiles");
+        assert_eq!(store.attempt_count("a.mbtiles"), 2);
+        assert_eq!(store.attempt_count("b.mbtiles"), 1);
+    }
+
+    #[tokio::test]
+    async fn empty_requests_return_empty() {
+        let store = MockSource::new(&[]);
+
+        let downloads = download_all(store.clone(), &transfer_config(), Vec::new())
+            .await
+            .unwrap();
+        let uploads = upload_all(store.clone(), &transfer_config(), Vec::new())
+            .await
+            .unwrap();
+
+        assert!(downloads.is_empty());
+        assert!(uploads.is_empty());
+    }
+}
+

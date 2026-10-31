@@ -155,3 +155,32 @@ fn random_jitter(max: Duration) -> Duration {
     Duration::from_nanos((nanos % span) as u64)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_doubles_and_respects_cap() {
+        let backoff = BackoffConfig {
+            max_attempts: 4,
+            base_delay: Duration::from_secs(1),
+            max_delay: Some(Duration::from_secs(3)),
+            jitter: Duration::ZERO,
+        };
+
+        assert_eq!(backoff.delay_for_attempt(0), Duration::from_secs(1));
+        assert_eq!(backoff.delay_for_attempt(1), Duration::from_secs(2));
+        assert_eq!(backoff.delay_for_attempt(2), Duration::from_secs(3));
+        assert_eq!(backoff.delay_for_attempt(3), Duration::from_secs(3));
+    }
+
+    #[test]
+    fn backoff_saturates_instead_of_panicking() {
+        let backoff = BackoffConfig::new(2, Duration::from_secs(1));
+
+        let delay = backoff.delay_for_attempt(100);
+
+        assert_eq!(delay, Duration::from_secs(u32::MAX as u64));
+    }
+}
+
