@@ -6,3 +6,7 @@
 //! built-in source speaks S3, configured the same way Hetzner Object Storage
 //! is configured.
 
+mod config;
+
+pub use config::{BackoffConfig, S3Config, TransferConfig};
+
