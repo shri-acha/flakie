@@ -154,6 +154,8 @@ where
     }
 
     let max_attempts = config.max_attempts.max(1);
+    let policy = Arc::new(RetryPolicy::new(config)?);
+    let config = Arc::new(config.clone());
     let queue = Arc::new(Mutex::new(
         tasks
             .into_iter()
@@ -174,8 +176,8 @@ where
             Arc::clone(&queue),
             Arc::clone(&completed),
             Arc::clone(&failed),
-            max_attempts,
-            config.retry_delay,
+            Arc::clone(&config),
+            Arc::clone(&policy),
             operation,
         )));
     }
@@ -185,11 +187,12 @@ where
     }
 
     let mut completed = std::mem::take(&mut *completed.lock().expect("completed mutex poisoned"));
-    let failed = std::mem::take(&mut *failed.lock().expect("failed mutex poisoned"));
+    let mut failed = std::mem::take(&mut *failed.lock().expect("failed mutex poisoned"));
+    failed.sort();
 
     if !failed.is_empty() {
         anyhow::bail!(
-            "failed to {operation} {} item(s) after {max_attempts} attempts each: {}",
+            "failed to {operation} {} item(s) (at most {max_attempts} attempts each): {}",
             failed.len(),
             failed.join(", ")
         );
@@ -204,8 +207,8 @@ async fn run_worker<S: Source>(
     queue: Arc<Mutex<VecDeque<QueuedTask>>>,
     completed: Arc<Mutex<Vec<CompletedTransfer>>>,
     failed: Arc<Mutex<Vec<String>>>,
-    max_attempts: u32,
-    retry_delay: std::time::Duration,
+    config: Arc<TransferConfig>,
+    policy: Arc<RetryPolicy>,
     operation: &'static str,
 ) {
     loop {
@@ -213,7 +216,17 @@ async fn run_worker<S: Source>(
             return;
         };
 
-        match queued.task.execute(&source).await {
+        let result = if let Some(timeout) = config.attempt_timeout {
+            match tokio::time::timeout(timeout, queued.task.execute(&source)).await {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::anyhow!(
+                    "transfer attempt timed out after {timeout:?}"
+                )),
+            }
+        } else {
+            queued.task.execute(&source).await
+        };
+        match result {
             Ok(()) => {
                 tracing::info!(
                     operation,
@@ -231,7 +244,12 @@ async fn run_worker<S: Source>(
             }
             Err(error) => {
                 queued.attempts += 1;
-                if queued.attempts < max_attempts {
+                let decision = if queued.attempts < config.max_attempts.max(1) {
+                    policy.delay(&config, &queued, operation, &error)
+                } else {
+                    Ok(None)
+                };
+                if let Ok(Some(retry_delay)) = decision {
                     tracing::warn!(
                         operation,
                         key = %queued.task.key(),
@@ -247,20 +265,90 @@ async fn run_worker<S: Source>(
                         .expect("queue mutex poisoned")
                         .push_back(queued);
                 } else {
+                    let reason = match decision {
+                        Err(policy_error) => {
+                            format!("{error:#}; retry policy failed: {policy_error:#}")
+                        }
+                        _ => format!("{error:#}"),
+                    };
                     tracing::error!(
                         operation,
                         key = %queued.task.key(),
                         attempts = queued.attempts,
                         %error,
-                        "transfer failed after max attempts"
+                        "transfer failed; no further retries"
                     );
                     failed
                         .lock()
                         .expect("failed mutex poisoned")
-                        .push(queued.task.key().to_string());
+                        .push(format!("{}: {reason}", queued.task.key()));
                 }
             }
         }
+    }
+}
+
+struct RetryPolicy {
+    #[cfg(feature = "scripting")]
+    script: Option<(rhai::Engine, rhai::AST)>,
+}
+
+impl RetryPolicy {
+    fn new(_config: &TransferConfig) -> anyhow::Result<Self> {
+        Ok(Self {
+            #[cfg(feature = "scripting")]
+            script: _config
+                .retry_script
+                .as_ref()
+                .map(|script| {
+                    let mut engine = rhai::Engine::new();
+                    engine.set_max_operations(10_000);
+                    engine.set_max_call_levels(16);
+                    engine.set_max_expr_depths(32, 16);
+                    engine.set_max_string_size(65_536);
+                    engine.set_max_array_size(1_024);
+                    engine.set_max_map_size(128);
+                    let ast = engine.compile(script).context("compiling retry script")?;
+                    Ok::<_, anyhow::Error>((engine, ast))
+                })
+                .transpose()?,
+        })
+    }
+
+    fn delay(
+        &self,
+        config: &TransferConfig,
+        queued: &QueuedTask,
+        _operation: &str,
+        _error: &anyhow::Error,
+    ) -> anyhow::Result<Option<std::time::Duration>> {
+        let delay = config
+            .retry_backoff
+            .as_ref()
+            .map(|backoff| backoff.delay_for_attempt(queued.attempts - 1))
+            .unwrap_or(config.retry_delay);
+        #[cfg(feature = "scripting")]
+        if let Some((engine, ast)) = &self.script {
+            let mut scope = rhai::Scope::new();
+            scope.push_constant("key", queued.task.key().to_string());
+            scope.push_constant("operation", _operation.to_string());
+            scope.push_constant("attempt", i64::from(queued.attempts));
+            scope.push_constant("max_attempts", i64::from(config.max_attempts.max(1)));
+            scope.push_constant("error", format!("{_error:#}"));
+            scope.push_constant(
+                "default_delay_ms",
+                delay.as_millis().min(i64::MAX as u128) as i64,
+            );
+            let millis = engine
+                .eval_ast_with_scope::<i64>(&mut scope, ast)
+                .context("evaluating retry script")?;
+            anyhow::ensure!(
+                millis >= -1,
+                "retry script must return -1 or a nonnegative delay in milliseconds"
+            );
+            return Ok((millis >= 0).then(|| std::time::Duration::from_millis(millis as u64)));
+        }
+        Ok(Some(delay))
     }
 }
 
@@ -281,11 +369,13 @@ mod tests {
     struct MockSource {
         attempts: Arc<Mutex<HashMap<String, usize>>>,
         outcomes: Arc<Mutex<HashMap<String, VecDeque<bool>>>>,
+        delay: Duration,
     }
 
     impl MockSource {
         fn new(outcomes: &[(&str, Vec<bool>)]) -> Self {
             Self {
+                delay: Duration::ZERO,
                 attempts: Arc::new(Mutex::new(HashMap::new())),
                 outcomes: Arc::new(Mutex::new(
                     outcomes
@@ -335,7 +425,9 @@ mod tests {
     #[async_trait]
     impl Source for MockSource {
         async fn download(&self, key: &str, _path: &Path) -> anyhow::Result<()> {
-            self.next_outcome(key)
+            let result = self.next_outcome(key);
+            tokio::time::sleep(self.delay).await;
+            result
         }
 
         async fn upload(
@@ -361,6 +453,7 @@ mod tests {
             concurrency: 2,
             max_attempts: 3,
             retry_delay: Duration::ZERO,
+            ..TransferConfig::default()
         }
     }
 
@@ -433,5 +526,132 @@ mod tests {
 
         assert!(downloads.is_empty());
         assert!(uploads.is_empty());
+    }
+
+    #[tokio::test]
+    async fn timeout_retries_and_reports_the_cause() {
+        let mut store = MockSource::new(&[]);
+        store.delay = Duration::from_secs(60);
+        let config = TransferConfig {
+            attempt_timeout: Some(Duration::from_millis(1)),
+            ..transfer_config()
+        };
+        let error = download_all(
+            store.clone(),
+            &config,
+            vec![DownloadRequest::new("slow", "slow")],
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        assert_eq!(store.attempt_count("slow"), 3);
+    }
+
+    #[test]
+    fn queue_backoff_overrides_fixed_delay() {
+        let config = TransferConfig {
+            retry_backoff: Some(crate::BackoffConfig::new(1, Duration::from_millis(2))),
+            ..transfer_config()
+        };
+        let queued = super::QueuedTask {
+            task: super::Task::Download {
+                key: "key".into(),
+                path: "path".into(),
+            },
+            attempts: 3,
+        };
+        let policy = super::RetryPolicy::new(&config).unwrap();
+        assert_eq!(
+            policy
+                .delay(&config, &queued, "download", &anyhow::anyhow!("failed"))
+                .unwrap(),
+            Some(Duration::from_millis(8))
+        );
+    }
+
+    #[cfg(feature = "scripting")]
+    #[tokio::test]
+    async fn script_can_stop_retries_using_failure_context() {
+        let store = MockSource::new(&[("stop", vec![false, true])]);
+        let config = TransferConfig {
+            retry_script: Some(
+                r#"
+                if key == "stop" && operation == "download" && attempt == 1
+                    && max_attempts == 3 && error.contains("mock transfer failure") {
+                    -1
+                } else { default_delay_ms }
+            "#
+                .into(),
+            ),
+            ..transfer_config()
+        };
+        let error = download_all(
+            store.clone(),
+            &config,
+            vec![DownloadRequest::new("stop", "stop")],
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("stop"));
+        assert_eq!(store.attempt_count("stop"), 1);
+    }
+
+    #[cfg(feature = "scripting")]
+    #[tokio::test]
+    async fn script_can_retry_uploads() {
+        let store = MockSource::new(&[("retry", vec![false, true])]);
+        let config = TransferConfig {
+            retry_script: Some("if operation == \"upload\" { 0 } else { -1 }".into()),
+            ..transfer_config()
+        };
+        let completed = upload_all(
+            store.clone(),
+            &config,
+            vec![UploadRequest::new("retry", "retry", None::<String>)],
+        )
+        .await
+        .unwrap();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(store.attempt_count("retry"), 2);
+    }
+
+    #[cfg(feature = "scripting")]
+    #[tokio::test]
+    async fn invalid_script_fails_before_transferring() {
+        let store = MockSource::new(&[]);
+        let config = TransferConfig {
+            retry_script: Some("let =".into()),
+            ..transfer_config()
+        };
+        let error = download_all(
+            store.clone(),
+            &config,
+            vec![DownloadRequest::new("key", "path")],
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("compiling retry script"));
+        assert_eq!(store.attempt_count("key"), 0);
+    }
+
+    #[cfg(feature = "scripting")]
+    #[tokio::test]
+    async fn script_errors_and_infinite_loops_stop_the_item() {
+        for script in ["loop {}", "true", "-2", "1 / 0"] {
+            let store = MockSource::new(&[("key", vec![false, true])]);
+            let config = TransferConfig {
+                retry_script: Some(script.into()),
+                ..transfer_config()
+            };
+            let error = download_all(
+                store.clone(),
+                &config,
+                vec![DownloadRequest::new("key", "path")],
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("retry policy failed"), "{error}");
+            assert_eq!(store.attempt_count("key"), 1);
+        }
     }
 }

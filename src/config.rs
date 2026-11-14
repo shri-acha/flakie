@@ -62,6 +62,14 @@ pub struct TransferConfig {
     pub max_attempts: u32,
     /// Fixed delay before a failed item is moved back to the queue.
     pub retry_delay: Duration,
+    /// Optional exponential backoff, replacing `retry_delay`. Its
+    /// `max_attempts` is ignored; the queue's `max_attempts` remains the limit.
+    pub retry_backoff: Option<BackoffConfig>,
+    /// Timeout for each whole-item attempt, including source-level retries.
+    pub attempt_timeout: Option<Duration>,
+    /// Optional Rhai policy evaluated after a failed attempt.
+    #[cfg(feature = "scripting")]
+    pub retry_script: Option<String>,
 }
 
 impl Default for TransferConfig {
@@ -70,6 +78,10 @@ impl Default for TransferConfig {
             concurrency: 1,
             max_attempts: 3,
             retry_delay: Duration::from_secs(1),
+            retry_backoff: None,
+            attempt_timeout: None,
+            #[cfg(feature = "scripting")]
+            retry_script: None,
         }
     }
 }
