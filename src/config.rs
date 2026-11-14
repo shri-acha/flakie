@@ -98,6 +98,11 @@ pub struct S3Config {
     pub read_timeout: Duration,
     pub stalled_stream_grace_period: Duration,
     pub backoff: BackoffConfig,
+    pub force_path_style: bool,
+    pub sdk_max_attempts: u32,
+    pub session_token: Option<String>,
+    /// Preserve `.part` files after errors so a later call can resume.
+    pub keep_partial_downloads: bool,
 }
 
 impl S3Config {
@@ -118,6 +123,10 @@ impl S3Config {
             read_timeout: Duration::from_secs(120),
             stalled_stream_grace_period: Duration::from_secs(60),
             backoff: BackoffConfig::default(),
+            force_path_style: true,
+            sdk_max_attempts: 10,
+            session_token: None,
+            keep_partial_downloads: true,
         }
     }
 }
@@ -134,6 +143,10 @@ impl Default for S3Config {
             read_timeout: Duration::from_secs(120),
             stalled_stream_grace_period: Duration::from_secs(60),
             backoff: BackoffConfig::default(),
+            force_path_style: true,
+            sdk_max_attempts: 10,
+            session_token: None,
+            keep_partial_downloads: true,
         }
     }
 }
@@ -153,6 +166,13 @@ impl fmt::Debug for S3Config {
                 &self.stalled_stream_grace_period,
             )
             .field("backoff", &self.backoff)
+            .field("force_path_style", &self.force_path_style)
+            .field("sdk_max_attempts", &self.sdk_max_attempts)
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("keep_partial_downloads", &self.keep_partial_downloads)
             .finish()
     }
 }
@@ -196,5 +216,14 @@ mod tests {
         let delay = backoff.delay_for_attempt(100);
 
         assert_eq!(delay, Duration::from_secs(u32::MAX as u64));
+    }
+
+    #[test]
+    fn s3_debug_redacts_credentials() {
+        let mut config = S3Config::new("endpoint", "bucket", "access", "secret-value", "region");
+        config.session_token = Some("session-value".into());
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("secret-value"));
+        assert!(!debug.contains("session-value"));
     }
 }

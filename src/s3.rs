@@ -22,13 +22,14 @@ pub struct S3Source {
     client: aws_sdk_s3::Client,
     bucket: String,
     backoff: BackoffConfig,
+    keep_partial_downloads: bool,
 }
 
 impl S3Source {
     pub fn new(config: S3Config) -> Self {
         let sdk_config = aws_sdk_s3::config::Builder::new()
             .behavior_version(BehaviorVersion::latest())
-            .retry_config(RetryConfig::standard().with_max_attempts(10))
+            .retry_config(RetryConfig::standard().with_max_attempts(config.sdk_max_attempts.max(1)))
             .timeout_config(
                 TimeoutConfig::builder()
                     .connect_timeout(config.connect_timeout)
@@ -43,19 +44,20 @@ impl S3Source {
             .credentials_provider(Credentials::new(
                 config.access_key,
                 config.secret_key,
-                None,
+                config.session_token,
                 None,
                 "flakie",
             ))
             .region(Region::new(config.region))
             .endpoint_url(config.endpoint.trim_end_matches('/'))
-            .force_path_style(true)
+            .force_path_style(config.force_path_style)
             .build();
 
         Self {
             client: aws_sdk_s3::Client::from_conf(sdk_config),
             bucket: config.bucket,
             backoff: config.backoff,
+            keep_partial_downloads: config.keep_partial_downloads,
         }
     }
 
@@ -108,16 +110,19 @@ impl S3Source {
 impl Source for S3Source {
     async fn download(&self, key: &str, path: &Path) -> anyhow::Result<()> {
         let part_path = partial_download_path(path);
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
         let mut last_error = None;
 
-        for attempt in 0..self.backoff.max_attempts {
+        for attempt in 0..self.backoff.max_attempts.max(1) {
             match self.download_once(key, &part_path).await {
                 Ok(()) => {
-                    if let Some(parent) = path.parent() {
-                        tokio::fs::create_dir_all(parent)
-                            .await
-                            .with_context(|| format!("creating {}", parent.display()))?;
-                    }
                     tokio::fs::rename(&part_path, path).await.with_context(|| {
                         format!("renaming downloaded object {} to {}", key, path.display())
                     })?;
@@ -132,7 +137,9 @@ impl Source for S3Source {
             }
         }
 
-        let _ = tokio::fs::remove_file(&part_path).await;
+        if !self.keep_partial_downloads {
+            let _ = tokio::fs::remove_file(&part_path).await;
+        }
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("download failed")))
     }
 
