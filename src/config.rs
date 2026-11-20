@@ -1,4 +1,3 @@
-use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Retry backoff used by sources that resume a single transfer mid-stream.
@@ -53,7 +52,8 @@ impl Default for BackoffConfig {
     }
 }
 
-/// Whole-item transfer settings used by the download and upload engines.
+/// Whole-item queue settings used by [`run_all`](crate::run_all) and the
+/// download and upload helpers built on it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferConfig {
     /// Number of items moved concurrently.
@@ -83,97 +83,6 @@ impl Default for TransferConfig {
             #[cfg(feature = "scripting")]
             retry_script: None,
         }
-    }
-}
-
-/// Configuration for an S3-compatible source such as Hetzner Object Storage.
-#[derive(Clone, PartialEq, Eq)]
-pub struct S3Config {
-    pub endpoint: String,
-    pub bucket: String,
-    pub access_key: String,
-    pub secret_key: String,
-    pub region: String,
-    pub connect_timeout: Duration,
-    pub read_timeout: Duration,
-    pub stalled_stream_grace_period: Duration,
-    pub backoff: BackoffConfig,
-    pub force_path_style: bool,
-    pub sdk_max_attempts: u32,
-    pub session_token: Option<String>,
-    /// Preserve `.part` files after errors so a later call can resume.
-    pub keep_partial_downloads: bool,
-}
-
-impl S3Config {
-    pub fn new(
-        endpoint: impl Into<String>,
-        bucket: impl Into<String>,
-        access_key: impl Into<String>,
-        secret_key: impl Into<String>,
-        region: impl Into<String>,
-    ) -> Self {
-        Self {
-            endpoint: endpoint.into(),
-            bucket: bucket.into(),
-            access_key: access_key.into(),
-            secret_key: secret_key.into(),
-            region: region.into(),
-            connect_timeout: Duration::from_secs(10),
-            read_timeout: Duration::from_secs(120),
-            stalled_stream_grace_period: Duration::from_secs(60),
-            backoff: BackoffConfig::default(),
-            force_path_style: true,
-            sdk_max_attempts: 10,
-            session_token: None,
-            keep_partial_downloads: true,
-        }
-    }
-}
-
-impl Default for S3Config {
-    fn default() -> Self {
-        Self {
-            endpoint: String::new(),
-            bucket: String::new(),
-            access_key: String::new(),
-            secret_key: String::new(),
-            region: String::new(),
-            connect_timeout: Duration::from_secs(10),
-            read_timeout: Duration::from_secs(120),
-            stalled_stream_grace_period: Duration::from_secs(60),
-            backoff: BackoffConfig::default(),
-            force_path_style: true,
-            sdk_max_attempts: 10,
-            session_token: None,
-            keep_partial_downloads: true,
-        }
-    }
-}
-
-impl fmt::Debug for S3Config {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("S3Config")
-            .field("endpoint", &self.endpoint)
-            .field("bucket", &self.bucket)
-            .field("access_key", &self.access_key)
-            .field("secret_key", &"<redacted>")
-            .field("region", &self.region)
-            .field("connect_timeout", &self.connect_timeout)
-            .field("read_timeout", &self.read_timeout)
-            .field(
-                "stalled_stream_grace_period",
-                &self.stalled_stream_grace_period,
-            )
-            .field("backoff", &self.backoff)
-            .field("force_path_style", &self.force_path_style)
-            .field("sdk_max_attempts", &self.sdk_max_attempts)
-            .field(
-                "session_token",
-                &self.session_token.as_ref().map(|_| "<redacted>"),
-            )
-            .field("keep_partial_downloads", &self.keep_partial_downloads)
-            .finish()
     }
 }
 
@@ -216,14 +125,5 @@ mod tests {
         let delay = backoff.delay_for_attempt(100);
 
         assert_eq!(delay, Duration::from_secs(u32::MAX as u64));
-    }
-
-    #[test]
-    fn s3_debug_redacts_credentials() {
-        let mut config = S3Config::new("endpoint", "bucket", "access", "secret-value", "region");
-        config.session_token = Some("session-value".into());
-        let debug = format!("{config:?}");
-        assert!(!debug.contains("secret-value"));
-        assert!(!debug.contains("session-value"));
     }
 }

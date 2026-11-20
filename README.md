@@ -1,13 +1,21 @@
 # flakie
 <img width="250" height="150" alt="Gemini_Generated_Image_r7wm9r7wm9r7wm9r-removebg-preview" src="https://github.com/user-attachments/assets/5c69124b-2d26-487b-82c5-7a514df4ba00" />
 
-Configurable, resumable downloads and uploads from flaky sources.
+Configurable, resumable retries for work against flaky sources.
 
-`flakie` separates the data source from the retry policy used to move data.
-Sources are cheap-to-clone async traits, while a small queue engine applies
-bounded concurrency, per-item retries, and deterministic ordering. The first
-built-in source is S3-compatible object storage, configured the same way
-Hetzner Object Storage is configured.
+`flakie` separates *what* is done from the retry policy used to do it. The
+queue engine, `run_all`, runs any keyed async job with bounded concurrency,
+per-item retries, backoff, attempt timeouts, and optional Rhai retry policies.
+`download_all` and `upload_all` build on it to move files through any
+`Source`, and the built-in `S3Source` adds resumable downloads for any
+S3-compatible object store (AWS, Hetzner, MinIO, Cloudflare R2, ...).
+
+## Features
+
+- `s3` (default): `S3Source` and `S3Config`, backed by `aws-sdk-s3`. Disable
+  default features to use the queue engine and custom sources without the AWS
+  SDK.
+- `scripting`: Rhai retry policies (see below).
 
 ## Usage
 
@@ -22,7 +30,7 @@ async-trait = "0.1"
 tokio = { version = "1", features = ["full"] }
 ```
 
-Downloading from Hetzner Object Storage:
+Downloading from an S3-compatible store (Hetzner Object Storage here):
 
 ```rust
 use std::time::Duration;
@@ -40,8 +48,8 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     let requests = vec![
-        DownloadRequest::new("runs/42/a.mbtiles", "/tmp/a.mbtiles"),
-        DownloadRequest::new("runs/42/b.mbtiles", "/tmp/b.mbtiles"),
+        DownloadRequest::new("runs/42/a.bin", "/tmp/a.bin"),
+        DownloadRequest::new("runs/42/b.bin", "/tmp/b.bin"),
     ];
 
     let completed = download_all(
@@ -77,9 +85,9 @@ async fn upload_files(source: S3Source) -> anyhow::Result<()> {
     };
     let requests = vec![
         UploadRequest::new(
-            "/tmp/a.mbtiles",
-            "runs/42/a.mbtiles",
-            Some("application/vnd.sqlite3"),
+            "/tmp/a.bin",
+            "runs/42/a.bin",
+            Some("application/octet-stream"),
         ),
         UploadRequest::new("/tmp/notes.txt", "runs/42/notes.txt", None::<String>),
     ];
@@ -105,16 +113,49 @@ async fn delete_if_present(source: &S3Source, key: &str) -> anyhow::Result<()> {
 }
 ```
 
+## Arbitrary jobs
+
+`run_all` applies the same queue to any work. Items implement `Keyed` (already
+implemented for `String`, `DownloadRequest`, and `UploadRequest`), which names
+them in logs, errors, and retry scripts. Each attempt receives a clone of the
+item, and results come back in input order alongside each job's output:
+
+```rust
+use std::time::Duration;
+
+use flakie::{run_all, TransferConfig};
+
+async fn fetch_lengths(urls: Vec<String>) -> anyhow::Result<Vec<(String, usize)>> {
+    let config = TransferConfig {
+        concurrency: 8,
+        max_attempts: 4,
+        attempt_timeout: Some(Duration::from_secs(30)),
+        ..TransferConfig::default()
+    };
+    run_all(&config, "fetch", urls, |url: String| async move {
+        let body = http_get(&url).await?; // your HTTP client call
+        Ok(body.len())
+    })
+    .await
+}
+```
+
+The `operation` argument (`"fetch"` here) appears in error messages and is the
+`operation` constant seen by retry scripts. The job closure must be
+`Send + Sync + 'static`, and its future `Send + 'static`; clone shared clients
+into the future as `download_all` does with its source.
+
 ## Retry behavior
 
-The queue engine follows the rules used by the MBTiles downloader:
+The queue engine:
 
 - Items are pulled from a shared queue by a bounded number of workers.
 - A failed item waits for `TransferConfig::retry_delay`, or its configured
   backoff/script delay, then moves to the back of the queue.
 - After `TransferConfig::max_attempts` failures, the item is reported as
   failed. If any item fails, the whole call errors and lists every failed key.
-- Successful results are returned ordered by object key.
+- `download_all` and `upload_all` return successful results ordered by object
+  key; `run_all` returns them in input order.
 
 On top of that, `S3Source` makes a single large object resilient:
 
@@ -127,7 +168,8 @@ On top of that, `S3Source` makes a single large object resilient:
 
 ## Configuration
 
-`TransferConfig` controls whole-item queue behavior:
+`TransferConfig` controls whole-item queue behavior for `run_all`,
+`download_all`, and `upload_all`:
 
 - `concurrency`: number of items moved at once.
 - `max_attempts`: attempts before an item is declared failed.
@@ -167,7 +209,8 @@ literals, include `..TransferConfig::default()` to pick up new options.
 `S3Config` controls the S3 source:
 
 - `endpoint`, `bucket`, `access_key`, `secret_key`, and `region` describe the
-  object store. Endpoint and path-style access match Hetzner Object Storage.
+  object store. Path-style access is the default, which most S3-compatible
+  providers accept.
 - `connect_timeout`, `read_timeout`, and `stalled_stream_grace_period` tune the
   SDK HTTP client.
 - `backoff` configures resumed-download retries.
@@ -289,7 +332,8 @@ fn config_from_script_file() -> anyhow::Result<TransferConfig> {
 
 Scripts return an integer: `-1` stops retries for this item, and a nonnegative
 value gives the next delay in milliseconds (`0` retries immediately). The
-available constants are `key`, `operation` (`"download"` or `"upload"`),
+available constants are `key`, `operation` (`"download"`, `"upload"`, or the
+name passed to `run_all`),
 `attempt` (number of failures, starting at `1`), `max_attempts`, `error` (the
 formatted error chain), and `default_delay_ms` (the fixed or backoff delay).
 Use error text matching only when your source provides stable messages.
@@ -299,7 +343,7 @@ after failures while retries remain. They cannot exceed the queue attempt
 limit. Syntax errors reject the batch before transfers start; runtime errors,
 invalid return values, and resource-limit violations stop retries for the item
 and appear alongside the original error in the batch failure. Other queued
-items continue, and successful results remain sorted by key.
+items continue, and successful results keep their usual ordering.
 
 The engine limits each evaluation to 10,000 operations, with additional bounds
 on recursion, expression depth, strings, arrays, and maps. Module imports are
@@ -308,7 +352,8 @@ disabled, and no filesystem or network functions are registered. See the
 
 ## Custom sources
 
-Implement `Source` to talk to another protocol. This working local-directory
+Implement `Source` to talk to another storage protocol; for work that is not a
+file transfer, use `run_all` directly. This working local-directory
 source uses file copies and can be passed to the same queue engine. Keys in
 this example are trusted paths relative to `root`:
 
@@ -381,6 +426,7 @@ async fn main() -> anyhow::Result<()> {
 ```sh
 cargo test
 cargo test --all-features
+cargo test --no-default-features
 cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --all-features -- -D warnings
 ```
