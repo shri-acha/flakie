@@ -1,12 +1,14 @@
 use std::collections::VecDeque;
+use std::fmt;
 use std::future::Future;
-use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 
 use anyhow::Context;
+use tokio::task::{JoinError, JoinHandle, JoinSet};
 
 use crate::config::TransferConfig;
-use crate::source::{DownloadRequest, Source, UploadRequest};
 
 /// An item with a stable key used in logs, error messages, and retry scripts.
 pub trait Keyed {
@@ -20,31 +22,98 @@ impl Keyed for String {
     }
 }
 
-impl Keyed for DownloadRequest {
-    fn key(&self) -> &str {
-        &self.key
+/// An item that exhausted its retries or was stopped by the retry policy.
+#[derive(Debug)]
+pub struct FailedItem<T> {
+    pub item: T,
+    /// Number of attempts made, including the last one.
+    pub attempts: u32,
+    /// Error from the last attempt. If the retry policy itself failed, that
+    /// failure is attached as context.
+    pub error: anyhow::Error,
+}
+
+/// Outcome of a batch whose items succeed or fail independently.
+///
+/// Both lists are in the order the items were submitted.
+#[derive(Debug)]
+pub struct BatchReport<T, O> {
+    /// Name of the operation, as passed to [`run_batch`].
+    pub operation: String,
+    pub completed: Vec<(T, O)>,
+    pub failed: Vec<FailedItem<T>>,
+}
+
+impl<T: Keyed, O> BatchReport<T, O> {
+    /// Whether every item completed.
+    pub fn is_success(&self) -> bool {
+        self.failed.is_empty()
+    }
+
+    /// Return the completed items, or a [`BatchError`] describing every
+    /// failure if any item failed.
+    pub fn into_result(self) -> Result<Vec<(T, O)>, BatchError> {
+        if self.failed.is_empty() {
+            return Ok(self.completed);
+        }
+        let mut failures: Vec<_> = self
+            .failed
+            .into_iter()
+            .map(|failed| ItemFailure {
+                key: failed.item.key().to_string(),
+                attempts: failed.attempts,
+                error: failed.error,
+            })
+            .collect();
+        failures.sort_by(|left, right| left.key.cmp(&right.key));
+        Err(BatchError {
+            operation: self.operation,
+            failures,
+        })
     }
 }
 
-impl Keyed for UploadRequest {
-    fn key(&self) -> &str {
-        &self.key
+/// One failed item inside a [`BatchError`].
+#[derive(Debug)]
+pub struct ItemFailure {
+    pub key: String,
+    pub attempts: u32,
+    pub error: anyhow::Error,
+}
+
+/// Error returned by the all-or-nothing helpers when any item failed.
+///
+/// It can be recovered from an [`anyhow::Error`] with `downcast_ref`.
+/// Failures are sorted by key.
+#[derive(Debug)]
+pub struct BatchError {
+    pub operation: String,
+    pub failures: Vec<ItemFailure>,
+}
+
+impl fmt::Display for BatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "failed to {} {} item(s): ",
+            self.operation,
+            self.failures.len()
+        )?;
+        for (index, failure) in self.failures.iter().enumerate() {
+            if index > 0 {
+                f.write_str(", ")?;
+            }
+            write!(
+                f,
+                "{}: {:#} (after {} attempt(s))",
+                failure.key, failure.error, failure.attempts
+            )?;
+        }
+        Ok(())
     }
 }
 
-/// A successfully downloaded object.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompletedDownload {
-    pub key: String,
-    pub path: PathBuf,
-}
-
-/// A successfully uploaded object.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompletedUpload {
-    pub key: String,
-    pub path: PathBuf,
-}
+impl std::error::Error for BatchError {}
 
 #[derive(Debug)]
 struct QueuedItem<T> {
@@ -56,27 +125,29 @@ struct QueuedItem<T> {
 struct Shared<T, O, F> {
     queue: Mutex<VecDeque<QueuedItem<T>>>,
     completed: Mutex<Vec<(usize, T, O)>>,
-    failed: Mutex<Vec<String>>,
+    failed: Mutex<Vec<(usize, FailedItem<T>)>>,
     config: TransferConfig,
     policy: RetryPolicy,
     operation: String,
     run: F,
 }
 
-/// Run `run` for every item with bounded concurrency and per-item retries.
+/// Run `run` for every item with bounded concurrency and per-item retries,
+/// reporting successes and failures separately.
 ///
-/// This is the generic engine behind [`download_all`] and [`upload_all`]. Each
-/// attempt receives a clone of the item, so the job can be retried. `operation`
-/// names the work in logs, errors, and retry scripts.
+/// One item failing never stops the others. Each attempt receives a clone of
+/// the item and runs as its own Tokio task: a panic counts as a failed
+/// attempt, and an attempt that exceeds `attempt_timeout` is cancelled.
+/// Dropping the returned future cancels all in-flight attempts.
 ///
-/// Results are returned in the order the items were given. If any item
-/// exhausts its retries, the whole call fails and lists every failed key.
-pub async fn run_all<T, O, F, Fut>(
+/// The outer `Err` is reserved for problems with the batch itself, such as a
+/// retry script that does not compile.
+pub async fn run_batch<T, O, F, Fut>(
     config: &TransferConfig,
     operation: &str,
     items: Vec<T>,
     run: F,
-) -> anyhow::Result<Vec<(T, O)>>
+) -> anyhow::Result<BatchReport<T, O>>
 where
     T: Keyed + Clone + Send + 'static,
     O: Send + 'static,
@@ -84,10 +155,13 @@ where
     Fut: Future<Output = anyhow::Result<O>> + Send + 'static,
 {
     if items.is_empty() {
-        return Ok(Vec::new());
+        return Ok(BatchReport {
+            operation: operation.to_string(),
+            completed: Vec::new(),
+            failed: Vec::new(),
+        });
     }
 
-    let max_attempts = config.max_attempts.max(1);
     let worker_count = config.concurrency.max(1).min(items.len());
     let shared = Arc::new(Shared {
         queue: Mutex::new(
@@ -109,98 +183,80 @@ where
         run,
     });
 
-    let workers: Vec<_> = (0..worker_count)
-        .map(|_| tokio::spawn(run_worker(Arc::clone(&shared))))
-        .collect();
-    for worker in workers {
-        worker.await.context("transfer worker task failed")?;
+    // Dropping a JoinSet aborts its tasks, so cancelling this future (or
+    // returning early) does not leave workers running in the background.
+    let mut workers = JoinSet::new();
+    for _ in 0..worker_count {
+        workers.spawn(run_worker(Arc::clone(&shared)));
+    }
+    while let Some(joined) = workers.join_next().await {
+        joined.context("queue worker failed")?;
     }
 
     let mut completed =
         std::mem::take(&mut *shared.completed.lock().expect("completed mutex poisoned"));
     let mut failed = std::mem::take(&mut *shared.failed.lock().expect("failed mutex poisoned"));
-    failed.sort();
-
-    if !failed.is_empty() {
-        anyhow::bail!(
-            "failed to {operation} {} item(s) (at most {max_attempts} attempts each): {}",
-            failed.len(),
-            failed.join(", ")
-        );
-    }
-
     completed.sort_by_key(|(index, _, _)| *index);
-    Ok(completed
-        .into_iter()
-        .map(|(_, item, output)| (item, output))
-        .collect())
-}
+    failed.sort_by_key(|(index, _)| *index);
 
-/// Download every request with bounded concurrency and per-item retries.
-///
-/// Results are returned ordered by object key. If any item exhausts its
-/// retries, the whole call fails and lists every failed key.
-pub async fn download_all<S>(
-    source: S,
-    config: &TransferConfig,
-    requests: Vec<DownloadRequest>,
-) -> anyhow::Result<Vec<CompletedDownload>>
-where
-    S: Source + Clone + 'static,
-{
-    let completed = run_all(
-        config,
-        "download",
-        requests,
-        move |request: DownloadRequest| {
-            let source = source.clone();
-            async move { source.download(&request.key, &request.path).await }
-        },
-    )
-    .await?;
-
-    let mut completed: Vec<_> = completed
-        .into_iter()
-        .map(|(request, ())| CompletedDownload {
-            key: request.key,
-            path: request.path,
-        })
-        .collect();
-    completed.sort_by(|left, right| left.key.cmp(&right.key));
-    Ok(completed)
-}
-
-/// Upload every request with bounded concurrency and per-item retries.
-///
-/// Results are returned ordered by object key. If any item exhausts its
-/// retries, the whole call fails and lists every failed key.
-pub async fn upload_all<S>(
-    source: S,
-    config: &TransferConfig,
-    requests: Vec<UploadRequest>,
-) -> anyhow::Result<Vec<CompletedUpload>>
-where
-    S: Source + Clone + 'static,
-{
-    let completed = run_all(config, "upload", requests, move |request: UploadRequest| {
-        let source = source.clone();
-        async move {
-            source
-                .upload(&request.path, &request.key, request.content_type.as_deref())
-                .await
-        }
+    Ok(BatchReport {
+        operation: operation.to_string(),
+        completed: completed
+            .into_iter()
+            .map(|(_, item, output)| (item, output))
+            .collect(),
+        failed: failed.into_iter().map(|(_, failed)| failed).collect(),
     })
-    .await?;
+}
 
-    let mut completed: Vec<_> = completed
-        .into_iter()
-        .map(|(request, ())| CompletedUpload {
-            key: request.key,
-            path: request.path,
-        })
-        .collect();
-    completed.sort_by(|left, right| left.key.cmp(&right.key));
-    Ok(completed)
+/// Like [`run_batch`], but fails with a [`BatchError`] if any item fails.
+///
+/// Results are returned in the order the items were given.
+pub async fn run_all<T, O, F, Fut>(
+    config: &TransferConfig,
+    operation: &str,
+    items: Vec<T>,
+    run: F,
+) -> anyhow::Result<Vec<(T, O)>>
+where
+    T: Keyed + Clone + Send + 'static,
+    O: Send + 'static,
+    F: Fn(T) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = anyhow::Result<O>> + Send + 'static,
+{
+    Ok(run_batch(config, operation, items, run)
+        .await?
+        .into_result()?)
+}
+
+/// A spawned task that is aborted when its handle is dropped.
+struct AbortOnDrop<T>(JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl<T> Future for AbortOnDrop<T> {
+    type Output = Result<T, JoinError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.0).poll(cx)
+    }
+}
+
+fn join_error(error: JoinError) -> anyhow::Error {
+    if !error.is_panic() {
+        return anyhow::anyhow!("attempt was cancelled");
+    }
+    let payload = error.into_panic();
+    let message = payload
+        .downcast_ref::<&str>()
+        .map(|message| message.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_string());
+    anyhow::anyhow!("attempt panicked: {message}")
 }
 
 async fn run_worker<T, O, F, Fut>(shared: Arc<Shared<T, O, F>>)
@@ -222,15 +278,17 @@ where
             return;
         };
 
-        let attempt = (shared.run)(queued.item.clone());
-        let result = if let Some(timeout) = config.attempt_timeout {
-            match tokio::time::timeout(timeout, attempt).await {
-                Ok(result) => result,
-                Err(_) => Err(anyhow::anyhow!("attempt timed out after {timeout:?}")),
-            }
-        } else {
-            attempt.await
+        let attempt = AbortOnDrop(tokio::spawn((shared.run)(queued.item.clone())));
+        let joined = match config.attempt_timeout {
+            Some(timeout) => tokio::time::timeout(timeout, attempt)
+                .await
+                .unwrap_or_else(|_| {
+                    Ok(Err(anyhow::anyhow!("attempt timed out after {timeout:?}")))
+                }),
+            None => attempt.await,
         };
+        let result = joined.unwrap_or_else(|error| Err(join_error(error)));
+
         match result {
             Ok(output) => {
                 tracing::info!(operation, key = %queued.item.key(), "item completed");
@@ -253,54 +311,60 @@ where
                 } else {
                     Ok(None)
                 };
-                if let Ok(Some(retry_delay)) = decision {
-                    tracing::warn!(
-                        operation,
-                        key = %queued.item.key(),
-                        attempts = queued.attempts,
-                        %error,
-                        "item failed; moving it to the back of the queue"
-                    );
-                    if !retry_delay.is_zero() {
-                        tokio::time::sleep(retry_delay).await;
-                    }
-                    shared
-                        .queue
-                        .lock()
-                        .expect("queue mutex poisoned")
-                        .push_back(queued);
-                } else {
-                    let reason = match decision {
-                        Err(policy_error) => {
-                            format!("{error:#}; retry policy failed: {policy_error:#}")
+                match decision {
+                    Ok(Some(retry_delay)) => {
+                        tracing::warn!(
+                            operation,
+                            key = %queued.item.key(),
+                            attempts = queued.attempts,
+                            error = format!("{error:#}"),
+                            "item failed; moving it to the back of the queue"
+                        );
+                        if !retry_delay.is_zero() {
+                            tokio::time::sleep(retry_delay).await;
                         }
-                        _ => format!("{error:#}"),
-                    };
-                    tracing::error!(
-                        operation,
-                        key = %queued.item.key(),
-                        attempts = queued.attempts,
-                        %error,
-                        "item failed; no further retries"
-                    );
-                    shared
-                        .failed
-                        .lock()
-                        .expect("failed mutex poisoned")
-                        .push(format!("{}: {reason}", queued.item.key()));
+                        shared
+                            .queue
+                            .lock()
+                            .expect("queue mutex poisoned")
+                            .push_back(queued);
+                    }
+                    decision => {
+                        let error = match decision {
+                            Err(policy_error) => {
+                                error.context(format!("retry policy failed: {policy_error:#}"))
+                            }
+                            _ => error,
+                        };
+                        tracing::error!(
+                            operation,
+                            key = %queued.item.key(),
+                            attempts = queued.attempts,
+                            error = format!("{error:#}"),
+                            "item failed; no further retries"
+                        );
+                        shared.failed.lock().expect("failed mutex poisoned").push((
+                            queued.index,
+                            FailedItem {
+                                item: queued.item,
+                                attempts: queued.attempts,
+                                error,
+                            },
+                        ));
+                    }
                 }
             }
         }
     }
 }
 
-struct RetryPolicy {
+pub(crate) struct RetryPolicy {
     #[cfg(feature = "scripting")]
     script: Option<(rhai::Engine, rhai::AST)>,
 }
 
 impl RetryPolicy {
-    fn new(_config: &TransferConfig) -> anyhow::Result<Self> {
+    pub(crate) fn new(_config: &TransferConfig) -> anyhow::Result<Self> {
         Ok(Self {
             #[cfg(feature = "scripting")]
             script: _config
@@ -321,7 +385,7 @@ impl RetryPolicy {
         })
     }
 
-    fn delay(
+    pub(crate) fn delay(
         &self,
         config: &TransferConfig,
         _key: &str,
@@ -356,337 +420,5 @@ impl RetryPolicy {
             return Ok((millis >= 0).then(|| std::time::Duration::from_millis(millis as u64)));
         }
         Ok(Some(delay))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::{HashMap, VecDeque};
-    use std::path::Path;
-    use std::sync::{Arc, Mutex};
-    use std::time::Duration;
-
-    use async_trait::async_trait;
-
-    use super::{download_all, run_all, upload_all};
-    use crate::config::TransferConfig;
-    use crate::source::{DownloadRequest, Source, UploadRequest};
-
-    #[derive(Clone)]
-    struct MockSource {
-        attempts: Arc<Mutex<HashMap<String, usize>>>,
-        outcomes: Arc<Mutex<HashMap<String, VecDeque<bool>>>>,
-        delay: Duration,
-    }
-
-    impl MockSource {
-        fn new(outcomes: &[(&str, Vec<bool>)]) -> Self {
-            Self {
-                delay: Duration::ZERO,
-                attempts: Arc::new(Mutex::new(HashMap::new())),
-                outcomes: Arc::new(Mutex::new(
-                    outcomes
-                        .iter()
-                        .map(|(key, values)| {
-                            (
-                                key.to_string(),
-                                values.iter().copied().collect::<VecDeque<_>>(),
-                            )
-                        })
-                        .collect(),
-                )),
-            }
-        }
-
-        fn attempt_count(&self, key: &str) -> usize {
-            self.attempts
-                .lock()
-                .expect("attempts mutex poisoned")
-                .get(key)
-                .copied()
-                .unwrap_or_default()
-        }
-
-        fn next_outcome(&self, key: &str) -> anyhow::Result<()> {
-            let attempt = {
-                let mut attempts = self.attempts.lock().expect("attempts mutex poisoned");
-                let attempt = attempts.entry(key.to_string()).or_insert(0);
-                *attempt += 1;
-                *attempt
-            };
-            let succeeds = self
-                .outcomes
-                .lock()
-                .expect("outcomes mutex poisoned")
-                .get_mut(key)
-                .and_then(|outcomes| outcomes.pop_front())
-                .unwrap_or(true);
-            if succeeds {
-                Ok(())
-            } else {
-                anyhow::bail!("mock transfer failure on attempt {attempt}")
-            }
-        }
-    }
-
-    #[async_trait]
-    impl Source for MockSource {
-        async fn download(&self, key: &str, _path: &Path) -> anyhow::Result<()> {
-            let result = self.next_outcome(key);
-            tokio::time::sleep(self.delay).await;
-            result
-        }
-
-        async fn upload(
-            &self,
-            _path: &Path,
-            key: &str,
-            _content_type: Option<&str>,
-        ) -> anyhow::Result<()> {
-            self.next_outcome(key)
-        }
-
-        async fn exists(&self, _key: &str) -> anyhow::Result<bool> {
-            Ok(true)
-        }
-
-        async fn delete(&self, _key: &str) -> anyhow::Result<()> {
-            Ok(())
-        }
-    }
-
-    fn transfer_config() -> TransferConfig {
-        TransferConfig {
-            concurrency: 2,
-            max_attempts: 3,
-            retry_delay: Duration::ZERO,
-            ..TransferConfig::default()
-        }
-    }
-
-    #[tokio::test]
-    async fn failed_download_is_requeued_and_retried() {
-        let store = MockSource::new(&[("a", vec![false, true]), ("b", vec![true])]);
-        let requests = vec![
-            DownloadRequest::new("a", "/tmp/a"),
-            DownloadRequest::new("b", "/tmp/b"),
-        ];
-
-        let completed = download_all(store.clone(), &transfer_config(), requests)
-            .await
-            .unwrap();
-
-        assert_eq!(completed.len(), 2);
-        assert_eq!(completed[0].key, "a");
-        assert_eq!(completed[1].key, "b");
-        assert_eq!(store.attempt_count("a"), 2);
-        assert_eq!(store.attempt_count("b"), 1);
-    }
-
-    #[tokio::test]
-    async fn download_that_keeps_failing_is_reported_after_max_attempts() {
-        let store = MockSource::new(&[("a", vec![false, false, false]), ("b", vec![true])]);
-        let requests = vec![
-            DownloadRequest::new("a", "/tmp/a"),
-            DownloadRequest::new("b", "/tmp/b"),
-        ];
-
-        let result = download_all(store.clone(), &transfer_config(), requests).await;
-
-        assert!(result.is_err());
-        assert_eq!(store.attempt_count("a"), 3);
-        assert_eq!(store.attempt_count("b"), 1);
-    }
-
-    #[tokio::test]
-    async fn failed_upload_is_requeued_and_retried() {
-        let store = MockSource::new(&[("a", vec![false, true]), ("b", vec![true])]);
-        let requests = vec![
-            UploadRequest::new("/tmp/a", "a", None::<String>),
-            UploadRequest::new("/tmp/b", "b", None::<String>),
-        ];
-
-        let completed = upload_all(store.clone(), &transfer_config(), requests)
-            .await
-            .unwrap();
-
-        assert_eq!(completed.len(), 2);
-        assert_eq!(completed[0].key, "a");
-        assert_eq!(completed[1].key, "b");
-        assert_eq!(store.attempt_count("a"), 2);
-        assert_eq!(store.attempt_count("b"), 1);
-    }
-
-    #[tokio::test]
-    async fn empty_requests_return_empty() {
-        let store = MockSource::new(&[]);
-
-        let downloads = download_all(store.clone(), &transfer_config(), Vec::new())
-            .await
-            .unwrap();
-        let uploads = upload_all(store.clone(), &transfer_config(), Vec::new())
-            .await
-            .unwrap();
-
-        assert!(downloads.is_empty());
-        assert!(uploads.is_empty());
-    }
-
-    #[tokio::test]
-    async fn timeout_retries_and_reports_the_cause() {
-        let mut store = MockSource::new(&[]);
-        store.delay = Duration::from_secs(60);
-        let config = TransferConfig {
-            attempt_timeout: Some(Duration::from_millis(1)),
-            ..transfer_config()
-        };
-        let error = download_all(
-            store.clone(),
-            &config,
-            vec![DownloadRequest::new("slow", "slow")],
-        )
-        .await
-        .unwrap_err();
-        assert!(error.to_string().contains("timed out"));
-        assert_eq!(store.attempt_count("slow"), 3);
-    }
-
-    #[tokio::test]
-    async fn run_all_retries_arbitrary_jobs_and_keeps_input_order() {
-        let store = MockSource::new(&[("z", vec![false, true]), ("a", vec![true])]);
-        let jobs = vec!["z".to_string(), "a".to_string()];
-        let job_store = store.clone();
-        let completed = run_all(&transfer_config(), "measure", jobs, move |key: String| {
-            let store = job_store.clone();
-            async move {
-                store.next_outcome(&key)?;
-                Ok(key.len() + store.attempt_count(&key))
-            }
-        })
-        .await
-        .unwrap();
-
-        assert_eq!(completed, vec![("z".to_string(), 3), ("a".to_string(), 2)]);
-        assert_eq!(store.attempt_count("z"), 2);
-    }
-
-    #[tokio::test]
-    async fn run_all_reports_operation_and_key_on_failure() {
-        let error = run_all(
-            &transfer_config(),
-            "fetch",
-            vec!["https://example.invalid/x".to_string()],
-            |_key: String| async { Err::<(), _>(anyhow::anyhow!("connection reset")) },
-        )
-        .await
-        .unwrap_err()
-        .to_string();
-
-        assert!(error.starts_with("failed to fetch 1 item(s)"), "{error}");
-        assert!(
-            error.contains("https://example.invalid/x: connection reset"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn queue_backoff_overrides_fixed_delay() {
-        let config = TransferConfig {
-            retry_backoff: Some(crate::BackoffConfig::new(1, Duration::from_millis(2))),
-            ..transfer_config()
-        };
-        let policy = super::RetryPolicy::new(&config).unwrap();
-        assert_eq!(
-            policy
-                .delay(&config, "key", 3, "download", &anyhow::anyhow!("failed"))
-                .unwrap(),
-            Some(Duration::from_millis(8))
-        );
-    }
-
-    #[cfg(feature = "scripting")]
-    #[tokio::test]
-    async fn script_can_stop_retries_using_failure_context() {
-        let store = MockSource::new(&[("stop", vec![false, true])]);
-        let config = TransferConfig {
-            retry_script: Some(
-                r#"
-                if key == "stop" && operation == "download" && attempt == 1
-                    && max_attempts == 3 && error.contains("mock transfer failure") {
-                    -1
-                } else { default_delay_ms }
-            "#
-                .into(),
-            ),
-            ..transfer_config()
-        };
-        let error = download_all(
-            store.clone(),
-            &config,
-            vec![DownloadRequest::new("stop", "stop")],
-        )
-        .await
-        .unwrap_err();
-        assert!(error.to_string().contains("stop"));
-        assert_eq!(store.attempt_count("stop"), 1);
-    }
-
-    #[cfg(feature = "scripting")]
-    #[tokio::test]
-    async fn script_can_retry_uploads() {
-        let store = MockSource::new(&[("retry", vec![false, true])]);
-        let config = TransferConfig {
-            retry_script: Some("if operation == \"upload\" { 0 } else { -1 }".into()),
-            ..transfer_config()
-        };
-        let completed = upload_all(
-            store.clone(),
-            &config,
-            vec![UploadRequest::new("retry", "retry", None::<String>)],
-        )
-        .await
-        .unwrap();
-        assert_eq!(completed.len(), 1);
-        assert_eq!(store.attempt_count("retry"), 2);
-    }
-
-    #[cfg(feature = "scripting")]
-    #[tokio::test]
-    async fn invalid_script_fails_before_transferring() {
-        let store = MockSource::new(&[]);
-        let config = TransferConfig {
-            retry_script: Some("let =".into()),
-            ..transfer_config()
-        };
-        let error = download_all(
-            store.clone(),
-            &config,
-            vec![DownloadRequest::new("key", "path")],
-        )
-        .await
-        .unwrap_err();
-        assert!(error.to_string().contains("compiling retry script"));
-        assert_eq!(store.attempt_count("key"), 0);
-    }
-
-    #[cfg(feature = "scripting")]
-    #[tokio::test]
-    async fn script_errors_and_infinite_loops_stop_the_item() {
-        for script in ["loop {}", "true", "-2", "1 / 0"] {
-            let store = MockSource::new(&[("key", vec![false, true])]);
-            let config = TransferConfig {
-                retry_script: Some(script.into()),
-                ..transfer_config()
-            };
-            let error = download_all(
-                store.clone(),
-                &config,
-                vec![DownloadRequest::new("key", "path")],
-            )
-            .await
-            .unwrap_err();
-            assert!(error.to_string().contains("retry policy failed"), "{error}");
-            assert_eq!(store.attempt_count("key"), 1);
-        }
     }
 }

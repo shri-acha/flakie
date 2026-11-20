@@ -2,7 +2,7 @@
 name = "flakie"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.94.1"
 license = "UNLICENSED"
 description = "Configurable, resumable retries for work against flaky sources"
 
