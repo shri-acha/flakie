@@ -4,11 +4,17 @@
 Configurable, resumable retries for work against flaky sources.
 
 `flakie` separates *what* is done from the retry policy used to do it. The
-queue engine, `run_all`, runs any keyed async job with bounded concurrency,
-per-item retries, backoff, attempt timeouts, and optional Rhai retry policies.
-`download_all` and `upload_all` build on it to move files through any
-`Source`, and the built-in `S3Source` adds resumable downloads for any
-S3-compatible object store (AWS, Hetzner, MinIO, Cloudflare R2, ...).
+queue engine (`run_batch`, `run_all`) runs any keyed async job with bounded
+concurrency, per-item retries, backoff, attempt timeouts, and optional Rhai
+retry policies. `download_batch`/`upload_batch` (and their all-or-nothing
+`*_all` forms) build on it to move files through any `Source`, and
+`multipart_upload` sends one file as independently retried parts through any
+`MultipartSource`. The built-in `S3Source` implements both, with resumable,
+ETag-checked downloads for any S3-compatible object store (AWS, Hetzner,
+MinIO, Cloudflare R2, ...).
+
+Requires Rust 1.94.1 or newer with the default `s3` feature (an
+`aws-sdk-s3` requirement).
 
 ## Features
 
@@ -113,6 +119,44 @@ async fn delete_if_present(source: &S3Source, key: &str) -> anyhow::Result<()> {
 }
 ```
 
+## Partial failures
+
+The `*_all` functions are all-or-nothing: if any item fails, they return an
+error, even though the other items finished. When you want to keep what
+succeeded, use the `*_batch` form, which returns a `BatchReport`:
+
+```rust
+use flakie::{download_batch, DownloadRequest, S3Source, TransferConfig};
+
+async fn download_what_we_can(
+    source: S3Source,
+    requests: Vec<DownloadRequest>,
+) -> anyhow::Result<()> {
+    let report = download_batch(source, &TransferConfig::default(), requests).await?;
+
+    for (request, ()) in &report.completed {
+        println!("downloaded {} to {}", request.key, request.path.display());
+    }
+    for failed in &report.failed {
+        eprintln!(
+            "gave up on {} after {} attempt(s): {:#}",
+            failed.item.key, failed.attempts, failed.error
+        );
+    }
+    Ok(())
+}
+```
+
+Both lists are in submission order, and each failure carries the original
+request back so it can be resubmitted. The outer `Result` only fails for
+problems with the batch as a whole: a retry script that does not compile, or
+two requests sharing a download destination (or upload key).
+
+`report.into_result()` converts a report into the all-or-nothing form. The
+error it returns, which is also what `*_all` return, is a `BatchError`. You can
+recover it with `error.downcast_ref::<flakie::BatchError>()` to inspect each
+failed key, its attempt count, and its error.
+
 ## Arbitrary jobs
 
 `run_all` applies the same queue to any work. Items implement `Keyed` (already
@@ -140,10 +184,62 @@ async fn fetch_lengths(urls: Vec<String>) -> anyhow::Result<Vec<(String, usize)>
 }
 ```
 
-The `operation` argument (`"fetch"` here) appears in error messages and is the
+`run_batch` is the same with a `BatchReport` instead of all-or-nothing. The
+`operation` argument (`"fetch"` here) appears in error messages and is the
 `operation` constant seen by retry scripts. The job closure must be
 `Send + Sync + 'static`, and its future `Send + 'static`; clone shared clients
 into the future as `download_all` does with its source.
+
+## Multipart uploads
+
+`multipart_upload` splits one file into parts, uploads them concurrently with
+per-part retries, and completes the upload. If a part exhausts its retries, or
+the file changes while it is being read, the upload is aborted so no orphaned
+parts are left behind. Dropping the future (for example, through an
+`attempt_timeout`) also aborts the upload in the background.
+
+`S3Source::upload` does this automatically for files of at least
+`S3Config::multipart_threshold` (64 MiB by default). Smaller files use a single
+`PutObject`. To use it with another backend, implement `MultipartSource`:
+
+```rust
+use async_trait::async_trait;
+use flakie::{MultipartSource, PartLimits, UploadedPart};
+
+#[derive(Clone)]
+struct MyStore;
+
+#[async_trait]
+impl MultipartSource for MyStore {
+    fn part_limits(&self) -> PartLimits {
+        PartLimits { min_part_size: 1024 * 1024, max_part_size: 1 << 30, max_parts: 1000 }
+    }
+
+    async fn create_multipart_upload(&self, key: &str, content_type: Option<&str>)
+        -> anyhow::Result<String> { todo!("start an upload and return its id") }
+
+    async fn upload_part(&self, key: &str, upload_id: &str, part_number: u32, data: Vec<u8>)
+        -> anyhow::Result<String> { todo!("store the part and return its token") }
+
+    async fn complete_multipart_upload(&self, key: &str, upload_id: &str, parts: &[UploadedPart])
+        -> anyhow::Result<()> { todo!("assemble parts, sorted by number") }
+
+    async fn abort_multipart_upload(&self, key: &str, upload_id: &str)
+        -> anyhow::Result<()> { todo!("discard the upload") }
+}
+```
+
+Then call `multipart_upload(MyStore, &MultipartConfig::default(), &request)`.
+`MultipartConfig` has two fields:
+
+- `part_size`: preferred part size (default 16 MiB). It is raised as needed to
+  meet the source's minimum part size and maximum part count.
+- `parts`: a `TransferConfig` for parts: concurrency (default 4), attempts
+  (default 5), backoff, and per-part timeouts.
+
+Each part attempt reads its bytes from disk, so memory use is about
+`part_size * concurrency`. An upload that fails as a whole is not resumed: if
+the queue retries the item, all parts are sent again.
 
 ## Retry behavior
 
@@ -153,23 +249,36 @@ The queue engine:
 - A failed item waits for `TransferConfig::retry_delay`, or its configured
   backoff/script delay, then moves to the back of the queue.
 - After `TransferConfig::max_attempts` failures, the item is reported as
-  failed. If any item fails, the whole call errors and lists every failed key.
+  failed. Other items are unaffected. `*_batch` functions report it, and
+  `*_all` functions return a `BatchError` listing every failed key.
+- Each attempt runs as its own Tokio task. A panic counts as a failed attempt,
+  and dropping the batch future cancels every in-flight attempt.
+- While a failed item waits out its retry delay, it holds its worker, so with
+  `concurrency: 1` the queue pauses for that delay.
 - `download_all` and `upload_all` return successful results ordered by object
   key; `run_all` returns them in input order.
 
 On top of that, `S3Source` makes a single large object resilient:
 
 - Downloads resume from the last successfully written byte through a `.part`
-  file and S3 range requests.
+  file and S3 range requests. The object's ETag is stored next to it in
+  `.part.etag`, and a resume uses `If-Match` so a replaced object is never
+  spliced onto an old prefix. If the ETag no longer matches, is missing, or
+  the partial file is longer than the object, the download restarts from
+  zero. A partial file that already holds the whole object is accepted
+  without downloading again.
+- A finished download must have exactly the length the server reported, or
+  it is retried. Content checksums are not verified.
 - Each resumed object is retried with exponential backoff and jitter as
   configured by `BackoffConfig`.
-- Uploads stream from disk with `ByteStream::from_path`, which restarts the
-  file read when the SDK retries a request.
+- Uploads below `multipart_threshold` stream from disk with
+  `ByteStream::from_path`, which restarts the file read when the SDK retries a
+  request. Larger uploads use `multipart_upload`.
 
 ## Configuration
 
-`TransferConfig` controls whole-item queue behavior for `run_all`,
-`download_all`, and `upload_all`:
+`TransferConfig` controls whole-item queue behavior for `run_batch`, `run_all`,
+and the download and upload helpers:
 
 - `concurrency`: number of items moved at once.
 - `max_attempts`: attempts before an item is declared failed.
@@ -222,6 +331,10 @@ literals, include `..TransferConfig::default()` to pick up new options.
   so later calls can resume. Set it to `false` to remove them after exhausted
   source retries. Cancellation, including an engine timeout, leaves partial
   files in place. Download parent directories are created automatically.
+- `multipart_threshold`: files at least this large use a multipart upload
+  (default `Some(64 MiB)`). `None` always uses one `PutObject`, which S3
+  limits to 5 GiB.
+- `multipart`: the `MultipartConfig` for those uploads.
 
 `BackoffConfig` controls source-level backoff:
 
@@ -263,7 +376,8 @@ fn configured_source() -> anyhow::Result<S3Source> {
 The SDK, resumed-download backoff, and queue each have their own attempt limit.
 Set `attempt_timeout` on the queue to bound an entire attempt across those
 source-level retries. To resume a failed download in a later call, submit the
-same key and destination path while its `.part` file is still present.
+same key and destination path while its `.part` and `.part.etag` files are
+still present.
 
 ## Rhai retry policies
 
@@ -333,7 +447,7 @@ fn config_from_script_file() -> anyhow::Result<TransferConfig> {
 Scripts return an integer: `-1` stops retries for this item, and a nonnegative
 value gives the next delay in milliseconds (`0` retries immediately). The
 available constants are `key`, `operation` (`"download"`, `"upload"`, or the
-name passed to `run_all`),
+name passed to `run_batch`/`run_all`; `"upload part"` for multipart parts),
 `attempt` (number of failures, starting at `1`), `max_attempts`, `error` (the
 formatted error chain), and `default_delay_ms` (the fixed or backoff delay).
 Use error text matching only when your source provides stable messages.
@@ -429,4 +543,16 @@ cargo test --all-features
 cargo test --no-default-features
 cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --all-features -- -D warnings
+```
+
+`tests/s3.rs` runs against a real S3-compatible server and is skipped unless
+`FLAKIE_TEST_S3_ENDPOINT` is set. With a local MinIO:
+
+```sh
+docker run -d --rm --name flakie-minio -p 127.0.0.1:19000:9000 \
+  -e MINIO_ROOT_USER=flakie -e MINIO_ROOT_PASSWORD=flakie-secret \
+  minio/minio server /data
+FLAKIE_TEST_S3_ENDPOINT=http://127.0.0.1:19000 \
+FLAKIE_TEST_S3_ACCESS_KEY=flakie FLAKIE_TEST_S3_SECRET_KEY=flakie-secret \
+  cargo test --test s3
 ```

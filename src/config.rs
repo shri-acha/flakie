@@ -1,3 +1,5 @@
+use std::collections::hash_map::RandomState;
+use std::hash::BuildHasher;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Retry backoff used by sources that resume a single transfer mid-stream.
@@ -86,17 +88,45 @@ impl Default for TransferConfig {
     }
 }
 
+/// Settings for [`multipart_upload`](crate::multipart_upload).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultipartConfig {
+    /// Preferred part size in bytes. It is raised when needed to satisfy the
+    /// source's minimum part size and maximum part count.
+    pub part_size: u64,
+    /// Queue settings applied to individual parts: how many parts upload at
+    /// once, and how each part is retried and timed out.
+    pub parts: TransferConfig,
+}
+
+impl Default for MultipartConfig {
+    fn default() -> Self {
+        Self {
+            part_size: 16 * 1024 * 1024,
+            parts: TransferConfig {
+                concurrency: 4,
+                max_attempts: 5,
+                retry_backoff: Some(BackoffConfig::default()),
+                ..TransferConfig::default()
+            },
+        }
+    }
+}
+
 fn random_jitter(max: Duration) -> Duration {
     if max.is_zero() {
         return Duration::ZERO;
     }
 
+    // Each `RandomState` is seeded from OS randomness (then perturbed per
+    // instance), so concurrent workers do not draw correlated jitter.
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
+    let random = u128::from(RandomState::new().hash_one(nanos));
     let span = max.as_nanos().saturating_add(1);
-    Duration::from_nanos((nanos % span) as u64)
+    Duration::from_nanos(u64::try_from(random % span).unwrap_or(u64::MAX))
 }
 
 #[cfg(test)]
@@ -116,6 +146,14 @@ mod tests {
         assert_eq!(backoff.delay_for_attempt(1), Duration::from_secs(2));
         assert_eq!(backoff.delay_for_attempt(2), Duration::from_secs(3));
         assert_eq!(backoff.delay_for_attempt(3), Duration::from_secs(3));
+    }
+
+    #[test]
+    fn jitter_stays_within_bound_and_varies() {
+        let max = Duration::from_millis(10);
+        let samples: Vec<_> = (0..64).map(|_| random_jitter(max)).collect();
+        assert!(samples.iter().all(|delay| *delay <= max));
+        assert!(samples.iter().any(|delay| *delay != samples[0]));
     }
 
     #[test]
