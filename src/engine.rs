@@ -1,11 +1,36 @@
 use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
+use std::future::Future;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 
 use crate::config::TransferConfig;
 use crate::source::{DownloadRequest, Source, UploadRequest};
+
+/// An item with a stable key used in logs, error messages, and retry scripts.
+pub trait Keyed {
+    /// Identifier for this item, such as an object key or URL.
+    fn key(&self) -> &str;
+}
+
+impl Keyed for String {
+    fn key(&self) -> &str {
+        self
+    }
+}
+
+impl Keyed for DownloadRequest {
+    fn key(&self) -> &str {
+        &self.key
+    }
+}
+
+impl Keyed for UploadRequest {
+    fn key(&self) -> &str {
+        &self.key
+    }
+}
 
 /// A successfully downloaded object.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,54 +46,94 @@ pub struct CompletedUpload {
     pub path: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CompletedTransfer {
-    key: String,
-    path: PathBuf,
-}
-
-#[derive(Debug, Clone)]
-enum Task {
-    Download {
-        key: String,
-        path: PathBuf,
-    },
-    Upload {
-        key: String,
-        path: PathBuf,
-        content_type: Option<String>,
-    },
-}
-
-impl Task {
-    fn key(&self) -> &str {
-        match self {
-            Self::Download { key, .. } | Self::Upload { key, .. } => key,
-        }
-    }
-
-    fn path(&self) -> &Path {
-        match self {
-            Self::Download { path, .. } | Self::Upload { path, .. } => path,
-        }
-    }
-
-    async fn execute<S: Source>(&self, source: &S) -> anyhow::Result<()> {
-        match self {
-            Self::Download { key, path } => source.download(key, path).await,
-            Self::Upload {
-                key,
-                path,
-                content_type,
-            } => source.upload(path, key, content_type.as_deref()).await,
-        }
-    }
-}
-
 #[derive(Debug)]
-struct QueuedTask {
-    task: Task,
+struct QueuedItem<T> {
+    index: usize,
+    item: T,
     attempts: u32,
+}
+
+struct Shared<T, O, F> {
+    queue: Mutex<VecDeque<QueuedItem<T>>>,
+    completed: Mutex<Vec<(usize, T, O)>>,
+    failed: Mutex<Vec<String>>,
+    config: TransferConfig,
+    policy: RetryPolicy,
+    operation: String,
+    run: F,
+}
+
+/// Run `run` for every item with bounded concurrency and per-item retries.
+///
+/// This is the generic engine behind [`download_all`] and [`upload_all`]. Each
+/// attempt receives a clone of the item, so the job can be retried. `operation`
+/// names the work in logs, errors, and retry scripts.
+///
+/// Results are returned in the order the items were given. If any item
+/// exhausts its retries, the whole call fails and lists every failed key.
+pub async fn run_all<T, O, F, Fut>(
+    config: &TransferConfig,
+    operation: &str,
+    items: Vec<T>,
+    run: F,
+) -> anyhow::Result<Vec<(T, O)>>
+where
+    T: Keyed + Clone + Send + 'static,
+    O: Send + 'static,
+    F: Fn(T) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = anyhow::Result<O>> + Send + 'static,
+{
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let max_attempts = config.max_attempts.max(1);
+    let worker_count = config.concurrency.max(1).min(items.len());
+    let shared = Arc::new(Shared {
+        queue: Mutex::new(
+            items
+                .into_iter()
+                .enumerate()
+                .map(|(index, item)| QueuedItem {
+                    index,
+                    item,
+                    attempts: 0,
+                })
+                .collect(),
+        ),
+        completed: Mutex::new(Vec::new()),
+        failed: Mutex::new(Vec::new()),
+        policy: RetryPolicy::new(config)?,
+        config: config.clone(),
+        operation: operation.to_string(),
+        run,
+    });
+
+    let workers: Vec<_> = (0..worker_count)
+        .map(|_| tokio::spawn(run_worker(Arc::clone(&shared))))
+        .collect();
+    for worker in workers {
+        worker.await.context("transfer worker task failed")?;
+    }
+
+    let mut completed =
+        std::mem::take(&mut *shared.completed.lock().expect("completed mutex poisoned"));
+    let mut failed = std::mem::take(&mut *shared.failed.lock().expect("failed mutex poisoned"));
+    failed.sort();
+
+    if !failed.is_empty() {
+        anyhow::bail!(
+            "failed to {operation} {} item(s) (at most {max_attempts} attempts each): {}",
+            failed.len(),
+            failed.join(", ")
+        );
+    }
+
+    completed.sort_by_key(|(index, _, _)| *index);
+    Ok(completed
+        .into_iter()
+        .map(|(_, item, output)| (item, output))
+        .collect())
 }
 
 /// Download every request with bounded concurrency and per-item retries.
@@ -83,26 +148,26 @@ pub async fn download_all<S>(
 where
     S: Source + Clone + 'static,
 {
-    if requests.is_empty() {
-        return Ok(Vec::new());
-    }
+    let completed = run_all(
+        config,
+        "download",
+        requests,
+        move |request: DownloadRequest| {
+            let source = source.clone();
+            async move { source.download(&request.key, &request.path).await }
+        },
+    )
+    .await?;
 
-    let tasks = requests
+    let mut completed: Vec<_> = completed
         .into_iter()
-        .map(|request| Task::Download {
+        .map(|(request, ())| CompletedDownload {
             key: request.key,
             path: request.path,
         })
         .collect();
-    let completed = run_tasks(source, config, "download", tasks).await?;
-
-    Ok(completed
-        .into_iter()
-        .map(|item| CompletedDownload {
-            key: item.key,
-            path: item.path,
-        })
-        .collect())
+    completed.sort_by(|left, right| left.key.cmp(&right.key));
+    Ok(completed)
 }
 
 /// Upload every request with bounded concurrency and per-item retries.
@@ -117,150 +182,90 @@ pub async fn upload_all<S>(
 where
     S: Source + Clone + 'static,
 {
-    if requests.is_empty() {
-        return Ok(Vec::new());
-    }
+    let completed = run_all(config, "upload", requests, move |request: UploadRequest| {
+        let source = source.clone();
+        async move {
+            source
+                .upload(&request.path, &request.key, request.content_type.as_deref())
+                .await
+        }
+    })
+    .await?;
 
-    let tasks = requests
+    let mut completed: Vec<_> = completed
         .into_iter()
-        .map(|request| Task::Upload {
+        .map(|(request, ())| CompletedUpload {
             key: request.key,
             path: request.path,
-            content_type: request.content_type,
         })
         .collect();
-    let completed = run_tasks(source, config, "upload", tasks).await?;
-
-    Ok(completed
-        .into_iter()
-        .map(|item| CompletedUpload {
-            key: item.key,
-            path: item.path,
-        })
-        .collect())
-}
-
-async fn run_tasks<S>(
-    source: S,
-    config: &TransferConfig,
-    operation: &'static str,
-    tasks: Vec<Task>,
-) -> anyhow::Result<Vec<CompletedTransfer>>
-where
-    S: Source + Clone + 'static,
-{
-    if tasks.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let max_attempts = config.max_attempts.max(1);
-    let policy = Arc::new(RetryPolicy::new(config)?);
-    let config = Arc::new(config.clone());
-    let queue = Arc::new(Mutex::new(
-        tasks
-            .into_iter()
-            .map(|task| QueuedTask { task, attempts: 0 })
-            .collect::<VecDeque<_>>(),
-    ));
-    let completed = Arc::new(Mutex::new(Vec::<CompletedTransfer>::new()));
-    let failed = Arc::new(Mutex::new(Vec::<String>::new()));
-
-    let worker_count = config
-        .concurrency
-        .max(1)
-        .min(queue.lock().expect("queue mutex poisoned").len());
-    let mut workers = Vec::with_capacity(worker_count);
-    for _ in 0..worker_count {
-        workers.push(tokio::spawn(run_worker(
-            source.clone(),
-            Arc::clone(&queue),
-            Arc::clone(&completed),
-            Arc::clone(&failed),
-            Arc::clone(&config),
-            Arc::clone(&policy),
-            operation,
-        )));
-    }
-
-    for worker in workers {
-        worker.await.context("transfer worker task failed")?;
-    }
-
-    let mut completed = std::mem::take(&mut *completed.lock().expect("completed mutex poisoned"));
-    let mut failed = std::mem::take(&mut *failed.lock().expect("failed mutex poisoned"));
-    failed.sort();
-
-    if !failed.is_empty() {
-        anyhow::bail!(
-            "failed to {operation} {} item(s) (at most {max_attempts} attempts each): {}",
-            failed.len(),
-            failed.join(", ")
-        );
-    }
-
     completed.sort_by(|left, right| left.key.cmp(&right.key));
     Ok(completed)
 }
 
-async fn run_worker<S: Source>(
-    source: S,
-    queue: Arc<Mutex<VecDeque<QueuedTask>>>,
-    completed: Arc<Mutex<Vec<CompletedTransfer>>>,
-    failed: Arc<Mutex<Vec<String>>>,
-    config: Arc<TransferConfig>,
-    policy: Arc<RetryPolicy>,
-    operation: &'static str,
-) {
+async fn run_worker<T, O, F, Fut>(shared: Arc<Shared<T, O, F>>)
+where
+    T: Keyed + Clone + Send + 'static,
+    O: Send + 'static,
+    F: Fn(T) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = anyhow::Result<O>> + Send + 'static,
+{
+    let config = &shared.config;
+    let operation = shared.operation.as_str();
     loop {
-        let Some(mut queued) = queue.lock().expect("queue mutex poisoned").pop_front() else {
+        let Some(mut queued) = shared
+            .queue
+            .lock()
+            .expect("queue mutex poisoned")
+            .pop_front()
+        else {
             return;
         };
 
+        let attempt = (shared.run)(queued.item.clone());
         let result = if let Some(timeout) = config.attempt_timeout {
-            match tokio::time::timeout(timeout, queued.task.execute(&source)).await {
+            match tokio::time::timeout(timeout, attempt).await {
                 Ok(result) => result,
-                Err(_) => Err(anyhow::anyhow!(
-                    "transfer attempt timed out after {timeout:?}"
-                )),
+                Err(_) => Err(anyhow::anyhow!("attempt timed out after {timeout:?}")),
             }
         } else {
-            queued.task.execute(&source).await
+            attempt.await
         };
         match result {
-            Ok(()) => {
-                tracing::info!(
-                    operation,
-                    key = %queued.task.key(),
-                    path = %queued.task.path().display(),
-                    "transfer completed"
-                );
-                completed
+            Ok(output) => {
+                tracing::info!(operation, key = %queued.item.key(), "item completed");
+                shared
+                    .completed
                     .lock()
                     .expect("completed mutex poisoned")
-                    .push(CompletedTransfer {
-                        key: queued.task.key().to_string(),
-                        path: queued.task.path().to_path_buf(),
-                    });
+                    .push((queued.index, queued.item, output));
             }
             Err(error) => {
                 queued.attempts += 1;
                 let decision = if queued.attempts < config.max_attempts.max(1) {
-                    policy.delay(&config, &queued, operation, &error)
+                    shared.policy.delay(
+                        config,
+                        queued.item.key(),
+                        queued.attempts,
+                        operation,
+                        &error,
+                    )
                 } else {
                     Ok(None)
                 };
                 if let Ok(Some(retry_delay)) = decision {
                     tracing::warn!(
                         operation,
-                        key = %queued.task.key(),
+                        key = %queued.item.key(),
                         attempts = queued.attempts,
                         %error,
-                        "transfer failed; moving it to the back of the queue"
+                        "item failed; moving it to the back of the queue"
                     );
                     if !retry_delay.is_zero() {
                         tokio::time::sleep(retry_delay).await;
                     }
-                    queue
+                    shared
+                        .queue
                         .lock()
                         .expect("queue mutex poisoned")
                         .push_back(queued);
@@ -273,15 +278,16 @@ async fn run_worker<S: Source>(
                     };
                     tracing::error!(
                         operation,
-                        key = %queued.task.key(),
+                        key = %queued.item.key(),
                         attempts = queued.attempts,
                         %error,
-                        "transfer failed; no further retries"
+                        "item failed; no further retries"
                     );
-                    failed
+                    shared
+                        .failed
                         .lock()
                         .expect("failed mutex poisoned")
-                        .push(format!("{}: {reason}", queued.task.key()));
+                        .push(format!("{}: {reason}", queued.item.key()));
                 }
             }
         }
@@ -318,21 +324,22 @@ impl RetryPolicy {
     fn delay(
         &self,
         config: &TransferConfig,
-        queued: &QueuedTask,
+        _key: &str,
+        attempts: u32,
         _operation: &str,
         _error: &anyhow::Error,
     ) -> anyhow::Result<Option<std::time::Duration>> {
         let delay = config
             .retry_backoff
             .as_ref()
-            .map(|backoff| backoff.delay_for_attempt(queued.attempts - 1))
+            .map(|backoff| backoff.delay_for_attempt(attempts - 1))
             .unwrap_or(config.retry_delay);
         #[cfg(feature = "scripting")]
         if let Some((engine, ast)) = &self.script {
             let mut scope = rhai::Scope::new();
-            scope.push_constant("key", queued.task.key().to_string());
+            scope.push_constant("key", _key.to_string());
             scope.push_constant("operation", _operation.to_string());
-            scope.push_constant("attempt", i64::from(queued.attempts));
+            scope.push_constant("attempt", i64::from(attempts));
             scope.push_constant("max_attempts", i64::from(config.max_attempts.max(1)));
             scope.push_constant("error", format!("{_error:#}"));
             scope.push_constant(
@@ -361,7 +368,7 @@ mod tests {
 
     use async_trait::async_trait;
 
-    use super::{download_all, upload_all};
+    use super::{download_all, run_all, upload_all};
     use crate::config::TransferConfig;
     use crate::source::{DownloadRequest, Source, UploadRequest};
 
@@ -459,10 +466,10 @@ mod tests {
 
     #[tokio::test]
     async fn failed_download_is_requeued_and_retried() {
-        let store = MockSource::new(&[("a.mbtiles", vec![false, true]), ("b.mbtiles", vec![true])]);
+        let store = MockSource::new(&[("a", vec![false, true]), ("b", vec![true])]);
         let requests = vec![
-            DownloadRequest::new("a.mbtiles", "/tmp/a.mbtiles"),
-            DownloadRequest::new("b.mbtiles", "/tmp/b.mbtiles"),
+            DownloadRequest::new("a", "/tmp/a"),
+            DownloadRequest::new("b", "/tmp/b"),
         ];
 
         let completed = download_all(store.clone(), &transfer_config(), requests)
@@ -470,36 +477,33 @@ mod tests {
             .unwrap();
 
         assert_eq!(completed.len(), 2);
-        assert_eq!(completed[0].key, "a.mbtiles");
-        assert_eq!(completed[1].key, "b.mbtiles");
-        assert_eq!(store.attempt_count("a.mbtiles"), 2);
-        assert_eq!(store.attempt_count("b.mbtiles"), 1);
+        assert_eq!(completed[0].key, "a");
+        assert_eq!(completed[1].key, "b");
+        assert_eq!(store.attempt_count("a"), 2);
+        assert_eq!(store.attempt_count("b"), 1);
     }
 
     #[tokio::test]
     async fn download_that_keeps_failing_is_reported_after_max_attempts() {
-        let store = MockSource::new(&[
-            ("a.mbtiles", vec![false, false, false]),
-            ("b.mbtiles", vec![true]),
-        ]);
+        let store = MockSource::new(&[("a", vec![false, false, false]), ("b", vec![true])]);
         let requests = vec![
-            DownloadRequest::new("a.mbtiles", "/tmp/a.mbtiles"),
-            DownloadRequest::new("b.mbtiles", "/tmp/b.mbtiles"),
+            DownloadRequest::new("a", "/tmp/a"),
+            DownloadRequest::new("b", "/tmp/b"),
         ];
 
         let result = download_all(store.clone(), &transfer_config(), requests).await;
 
         assert!(result.is_err());
-        assert_eq!(store.attempt_count("a.mbtiles"), 3);
-        assert_eq!(store.attempt_count("b.mbtiles"), 1);
+        assert_eq!(store.attempt_count("a"), 3);
+        assert_eq!(store.attempt_count("b"), 1);
     }
 
     #[tokio::test]
     async fn failed_upload_is_requeued_and_retried() {
-        let store = MockSource::new(&[("a.mbtiles", vec![false, true]), ("b.mbtiles", vec![true])]);
+        let store = MockSource::new(&[("a", vec![false, true]), ("b", vec![true])]);
         let requests = vec![
-            UploadRequest::new("/tmp/a.mbtiles", "a.mbtiles", None::<String>),
-            UploadRequest::new("/tmp/b.mbtiles", "b.mbtiles", None::<String>),
+            UploadRequest::new("/tmp/a", "a", None::<String>),
+            UploadRequest::new("/tmp/b", "b", None::<String>),
         ];
 
         let completed = upload_all(store.clone(), &transfer_config(), requests)
@@ -507,10 +511,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(completed.len(), 2);
-        assert_eq!(completed[0].key, "a.mbtiles");
-        assert_eq!(completed[1].key, "b.mbtiles");
-        assert_eq!(store.attempt_count("a.mbtiles"), 2);
-        assert_eq!(store.attempt_count("b.mbtiles"), 1);
+        assert_eq!(completed[0].key, "a");
+        assert_eq!(completed[1].key, "b");
+        assert_eq!(store.attempt_count("a"), 2);
+        assert_eq!(store.attempt_count("b"), 1);
     }
 
     #[tokio::test]
@@ -547,23 +551,54 @@ mod tests {
         assert_eq!(store.attempt_count("slow"), 3);
     }
 
+    #[tokio::test]
+    async fn run_all_retries_arbitrary_jobs_and_keeps_input_order() {
+        let store = MockSource::new(&[("z", vec![false, true]), ("a", vec![true])]);
+        let jobs = vec!["z".to_string(), "a".to_string()];
+        let job_store = store.clone();
+        let completed = run_all(&transfer_config(), "measure", jobs, move |key: String| {
+            let store = job_store.clone();
+            async move {
+                store.next_outcome(&key)?;
+                Ok(key.len() + store.attempt_count(&key))
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(completed, vec![("z".to_string(), 3), ("a".to_string(), 2)]);
+        assert_eq!(store.attempt_count("z"), 2);
+    }
+
+    #[tokio::test]
+    async fn run_all_reports_operation_and_key_on_failure() {
+        let error = run_all(
+            &transfer_config(),
+            "fetch",
+            vec!["https://example.invalid/x".to_string()],
+            |_key: String| async { Err::<(), _>(anyhow::anyhow!("connection reset")) },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.starts_with("failed to fetch 1 item(s)"), "{error}");
+        assert!(
+            error.contains("https://example.invalid/x: connection reset"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn queue_backoff_overrides_fixed_delay() {
         let config = TransferConfig {
             retry_backoff: Some(crate::BackoffConfig::new(1, Duration::from_millis(2))),
             ..transfer_config()
         };
-        let queued = super::QueuedTask {
-            task: super::Task::Download {
-                key: "key".into(),
-                path: "path".into(),
-            },
-            attempts: 3,
-        };
         let policy = super::RetryPolicy::new(&config).unwrap();
         assert_eq!(
             policy
-                .delay(&config, &queued, "download", &anyhow::anyhow!("failed"))
+                .delay(&config, "key", 3, "download", &anyhow::anyhow!("failed"))
                 .unwrap(),
             Some(Duration::from_millis(8))
         );
